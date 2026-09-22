@@ -38,7 +38,25 @@ go run ./cmd/archiveweave --addr 127.0.0.1:8080 --data ./var/artifacts.json --au
 - `POST /artifacts/{id}/review`：批准或退回。
 - `GET /artifacts/{id}/history`：读取按版本排序的审计轨迹。
 - `GET /artifacts/{id}/export`：导出单条已批准档案。
-- `GET /collections/export`：导出带校验和的公开集合。
+- `GET /collections/export`：导出带校验和的集合，筛选规则与 `GET /artifacts` 完全一致。
+
+### 筛选参数
+
+`GET /artifacts` 与 `GET /collections/export` 使用同一套筛选参数和同一个规范化解析器，返回体（或集合文件）中的 `query` 字段会完整描述实际生效的筛选条件，因此列表和导出不可能出现一边筛选、一边未筛选的差异：
+
+| 参数 | 说明 |
+| --- | --- |
+| `q` | 关键词，在标题、摘要、来源和标签文本中做不区分大小写的包含匹配。 |
+| `tag` | 必需标签，可重复给出（如 `tag=map&tag=mining`），也支持逗号分隔；多个标签为 **AND** 关系，档案必须同时拥有全部标签。标签匹配包含别名。 |
+| `exclude_tag` | 排除标签，语法同 `tag`；命中其中任意一个标签的档案都会被排除。 |
+| `year` | 精确年份（1000–2100 的四位数字）。 |
+| `year_from` / `year_to` | 包含两端的年份范围，可单独或组合给出。 |
+| `status` | 状态过滤；默认视图下只允许 `approved`。 |
+| `view` | `public`（默认，仅已批准）或 `working`（草稿、待审核和已批准均可见）。 |
+| `sort` | `recent`（默认）、`oldest` 或 `title`。 |
+| `offset` / `limit` | 分页，`limit` 范围 1–200。 |
+
+非法组合返回 `400` 与 `invalid_input` 错误体（含字段名），包括：年份不是四位数字；`year` 与 `year_from`/`year_to` 同时出现；`year_from` 晚于 `year_to`；同一标签同时出现在 `tag` 和 `exclude_tag`；以及原有的非法 `view`、`sort`、`status`、分页参数。筛选本身合法但没有匹配项时返回 `200`，`count` 为 `0`、`artifacts` 为空数组；集合导出同样返回 `count: 0` 和对空集合计算的有效校验和。
 
 写接口可以读取 `X-Archive-Actor` 请求头记录操作者。档案创建、修订、提交、批准和退回都会生成不可覆盖的审计事件。
 

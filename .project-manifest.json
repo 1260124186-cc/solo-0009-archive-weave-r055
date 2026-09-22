@@ -132,15 +132,15 @@
     {
       "id": "search-export",
       "name": "筛选与集合导出",
-      "entry": "GET /collections/export",
+      "entry": "GET /artifacts 与 GET /collections/export",
       "steps": [
-        "解析公开视图、关键词、标签、年份和排序条件",
-        "筛选并稳定排序档案集合",
-        "生成带 SHA-256 校验和的确定性 JSON"
+        "解析视图、关键词、多标签 AND、exclude_tag 排除、精确年份与 year_from/year_to 范围和排序条件",
+        "用同一套解析与过滤逻辑筛选并稳定排序档案集合",
+        "将规范化筛选写入 query 描述并生成带 SHA-256 校验和的确定性 JSON"
       ],
-      "success": "返回集合条数、查询描述、档案列表和校验和",
-      "failure": "非法筛选参数返回字段错误",
-      "verification": "只导出已批准档案并重新计算结果校验和",
+      "success": "公开视图只返回已批准档案，working 视图可见草稿与待审核；合法但无匹配返回 200 空集合，列表与导出结果及 query 描述一致",
+      "failure": "非法年份、year 与范围混用、范围倒置、同一标签既要求又排除等组合返回 400 字段错误",
+      "verification": "核对多标签组合、排除、年份范围、公开/工作视图差异、列表与导出一致性，并重新计算结果校验和",
       "module_ids": [
         "entry",
         "httpapi",

@@ -191,23 +191,134 @@ func checkSearchExport(ctx context.Context, h *harness) error {
 	if err != nil {
 		return err
 	}
-	if _, err := h.submit(ctx, first.ID); err != nil {
-		return err
-	}
-	if _, err := h.review(ctx, first.ID, "approve", "curator-lin", ""); err != nil {
-		return err
-	}
-	if _, err := h.submit(ctx, second.ID); err != nil {
-		return err
-	}
-	collection, err := h.exportCollection(ctx, "tag=map")
+	draft, err := h.create(ctx, "River survey log", "Survey log recording river soundings and channel notes", []string{"river", "survey"})
 	if err != nil {
 		return err
 	}
-	if collection.Count != 1 || len(collection.Artifacts) != 1 || !catalog.VerifyCollectionChecksum(collection) {
-		return fmt.Errorf("unexpected collection export: %#v", collection)
+	if _, err := h.update(ctx, second.ID, domain.CreateArtifact{
+		Title:   "Harbor shipping register",
+		Summary: "Register entry describing vessel arrivals at the harbor",
+		Source:  "Reading room transfer",
+		Year:    1958,
+		Tags:    []string{"harbor", "register"},
+	}); err != nil {
+		return err
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		if _, err := h.submit(ctx, id); err != nil {
+			return err
+		}
+		if _, err := h.review(ctx, id, "approve", "curator-lin", ""); err != nil {
+			return err
+		}
+	}
+
+	// Tags combine with AND: both tags are required.
+	match, err := h.exportCollection(ctx, "view=public&tag=mining&tag=map")
+	if err != nil {
+		return err
+	}
+	if match.Count != 1 || len(match.Artifacts) != 1 || match.Artifacts[0].ID != first.ID ||
+		!catalog.VerifyCollectionChecksum(match) {
+		return fmt.Errorf("unexpected AND tag collection: %#v", match)
+	}
+	if match.Query != "view=public,tag=map,tag=mining,sort=recent" {
+		return fmt.Errorf("collection query description missing tag filters: %q", match.Query)
+	}
+
+	// An AND combination that no artifact satisfies is an empty 200 response.
+	empty, err := h.exportCollection(ctx, "view=public&tag=mining&tag=harbor")
+	if err != nil {
+		return err
+	}
+	if empty.Count != 0 || len(empty.Artifacts) != 0 || !catalog.VerifyCollectionChecksum(empty) {
+		return fmt.Errorf("unexpected empty collection: %#v", empty)
+	}
+
+	// Tag exclusion removes matching artifacts but keeps the other approved one.
+	excluded, err := h.exportCollection(ctx, "view=public&exclude_tag=map")
+	if err != nil {
+		return err
+	}
+	if excluded.Count != 1 || excluded.Artifacts[0].ID != second.ID {
+		return fmt.Errorf("unexpected exclusion collection: %#v", excluded)
+	}
+
+	// Year ranges are inclusive on both ends.
+	ranged, err := h.exportCollection(ctx, "view=public&year_from=1940")
+	if err != nil {
+		return err
+	}
+	if ranged.Count != 1 || ranged.Artifacts[0].ID != second.ID {
+		return fmt.Errorf("unexpected year_from collection: %#v", ranged)
+	}
+	ranged, err = h.exportCollection(ctx, "view=public&year_from=1900&year_to=1940")
+	if err != nil {
+		return err
+	}
+	if ranged.Count != 1 || ranged.Artifacts[0].ID != first.ID {
+		return fmt.Errorf("unexpected year range collection: %#v", ranged)
+	}
+	exact, err := h.exportCollection(ctx, "view=public&year=1932")
+	if err != nil {
+		return err
+	}
+	if exact.Count != 1 || exact.Artifacts[0].ID != first.ID {
+		return fmt.Errorf("exact year must stay supported and hide drafts: %#v", exact)
+	}
+
+	// The draft is invisible in the public view but visible in the working view.
+	hidden, err := h.exportCollection(ctx, "view=public&tag=river&tag=survey")
+	if err != nil {
+		return err
+	}
+	if hidden.Count != 0 {
+		return fmt.Errorf("public view leaked a draft artifact: %#v", hidden)
+	}
+	working, err := h.exportCollection(ctx, "view=working&tag=river&tag=survey")
+	if err != nil {
+		return err
+	}
+	if working.Count != 1 || working.Artifacts[0].ID != draft.ID {
+		return fmt.Errorf("working view must include drafts: %#v", working)
+	}
+
+	// List and export must apply identical filters and describe them the same way.
+	list, err := h.listArtifacts(ctx, "tag=map&tag=mining")
+	if err != nil {
+		return err
+	}
+	if list.Count != 1 || len(list.Artifacts) != 1 || list.Artifacts[0].ID != first.ID {
+		return fmt.Errorf("unexpected AND tag list: %#v", list)
+	}
+	if list.Query != match.Query || list.Query != "view=public,tag=map,tag=mining,sort=recent" {
+		return fmt.Errorf("list and export query descriptions differ: %q vs %q", list.Query, match.Query)
+	}
+
+	// Illegal combinations are rejected with 400 on both filtered endpoints.
+	for _, raw := range []string{
+		"year=1932&year_from=1900",
+		"year_from=2000&year_to=1900",
+		"tag=map&exclude_tag=map",
+		"year=nineteen-thirty",
+	} {
+		for _, prefix := range []string{"/artifacts?", "/collections/export?"} {
+			status, err := h.statusFor(ctx, prefix+raw)
+			if err != nil {
+				return err
+			}
+			if status != http.StatusBadRequest {
+				return fmt.Errorf("GET %s%s status = %d, want 400", prefix, raw, status)
+			}
+		}
 	}
 	return nil
+}
+
+type artifactList struct {
+	Count     int               `json:"count"`
+	Query     string            `json:"query"`
+	Artifacts []domain.Artifact `json:"artifacts"`
 }
 
 func checkImportBatch(ctx context.Context, h *harness) error {
@@ -316,15 +427,38 @@ func (h *harness) exportArtifact(ctx context.Context, id string) (domain.Artifac
 }
 
 func (h *harness) exportCollection(ctx context.Context, query string) (catalog.Collection, error) {
-	path := "/collections/export?view=public"
+	path := "/collections/export"
 	if strings.TrimSpace(query) != "" {
-		path += "&" + strings.TrimSpace(query)
+		path += "?" + strings.TrimSpace(query)
 	}
 	var collection catalog.Collection
 	if err := h.request(ctx, http.MethodGet, path, nil, &collection); err != nil {
 		return catalog.Collection{}, err
 	}
 	return collection, nil
+}
+
+func (h *harness) listArtifacts(ctx context.Context, query string) (artifactList, error) {
+	path := "/artifacts?" + strings.TrimSpace(query)
+	var list artifactList
+	if err := h.request(ctx, http.MethodGet, path, nil, &list); err != nil {
+		return artifactList{}, err
+	}
+	return list, nil
+}
+
+func (h *harness) statusFor(ctx context.Context, path string) (int, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.base+path, nil)
+	if err != nil {
+		return 0, fmt.Errorf("create request: %w", err)
+	}
+	response, err := h.client.Do(request)
+	if err != nil {
+		return 0, fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 2<<20))
+	return response.StatusCode, nil
 }
 
 func (h *harness) importBatch(ctx context.Context, items []domain.CreateArtifact) (catalog.BatchResult, error) {
