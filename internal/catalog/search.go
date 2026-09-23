@@ -17,27 +17,35 @@ const (
 	SortRecent = "recent"
 	SortOldest = "oldest"
 	SortTitle  = "title"
+
+	TagMatchAll = "all"
+	TagMatchAny = "any"
 )
 
+const maxFilterTags = 24
+
 type Query struct {
-	Keyword string
-	Tag     string
-	Year    int
-	Status  domain.Status
-	View    string
-	Sort    string
-	Offset  int
-	Limit   int
+	Keyword     string
+	Tags        []string
+	TagMode     string
+	ExcludeTags []string
+	Year        int
+	YearFrom    int
+	YearTo      int
+	Status      domain.Status
+	View        string
+	Sort        string
+	Offset      int
+	Limit       int
 }
 
 func DefaultQuery() Query {
-	return Query{View: ViewPublic, Sort: SortRecent, Limit: 50}
+	return Query{View: ViewPublic, Sort: SortRecent, TagMode: TagMatchAll, Limit: 50}
 }
 
 func ParseQuery(values map[string]string) (Query, error) {
 	query := DefaultQuery()
 	query.Keyword = strings.TrimSpace(values["q"])
-	query.Tag = domain.NormalizeTagName(values["tag"])
 	query.View = strings.ToLower(strings.TrimSpace(values["view"]))
 	query.Sort = strings.ToLower(strings.TrimSpace(values["sort"]))
 	query.Status = domain.Status(strings.ToLower(strings.TrimSpace(values["status"])))
@@ -59,12 +67,56 @@ func ParseQuery(values map[string]string) (Query, error) {
 	if query.View == ViewPublic && query.Status != "" && query.Status != domain.StatusApproved {
 		return query, domain.Invalid("status", "public queries can only request approved artifacts")
 	}
+	tags, err := parseTagFilter(values["tag"], "tag")
+	if err != nil {
+		return query, err
+	}
+	query.Tags = tags
+	excludes, err := parseTagFilter(values["exclude_tag"], "exclude_tag")
+	if err != nil {
+		return query, err
+	}
+	query.ExcludeTags = excludes
+	if raw := strings.ToLower(strings.TrimSpace(values["tag_mode"])); raw != "" {
+		if raw != TagMatchAll && raw != TagMatchAny {
+			return query, domain.Invalid("tag_mode", "must be all or any")
+		}
+		if len(query.Tags) == 0 {
+			return query, domain.Invalid("tag_mode", "tag_mode requires at least one tag")
+		}
+		query.TagMode = raw
+	}
+	for _, tag := range query.Tags {
+		if containsString(query.ExcludeTags, tag) {
+			return query, domain.Invalid("exclude_tag", "tag cannot be both included and excluded: "+tag)
+		}
+	}
 	if raw := strings.TrimSpace(values["year"]); raw != "" {
-		year, err := strconv.Atoi(raw)
-		if err != nil || year < 1000 || year > 2100 {
+		year, ok := parseYearValue(raw)
+		if !ok {
 			return query, domain.Invalid("year", "year must be a valid four digit number")
 		}
 		query.Year = year
+	}
+	if raw := strings.TrimSpace(values["year_from"]); raw != "" {
+		year, ok := parseYearValue(raw)
+		if !ok {
+			return query, domain.Invalid("year_from", "year_from must be a valid four digit number")
+		}
+		query.YearFrom = year
+	}
+	if raw := strings.TrimSpace(values["year_to"]); raw != "" {
+		year, ok := parseYearValue(raw)
+		if !ok {
+			return query, domain.Invalid("year_to", "year_to must be a valid four digit number")
+		}
+		query.YearTo = year
+	}
+	if query.Year > 0 && (query.YearFrom > 0 || query.YearTo > 0) {
+		return query, domain.Invalid("year", "year cannot be combined with year_from or year_to")
+	}
+	if query.YearFrom > 0 && query.YearTo > 0 && query.YearFrom > query.YearTo {
+		return query, domain.Invalid("year_to", "year_to must not be earlier than year_from")
 	}
 	if raw := strings.TrimSpace(values["offset"]); raw != "" {
 		offset, err := strconv.Atoi(raw)
@@ -86,6 +138,44 @@ func ParseQuery(values map[string]string) (Query, error) {
 	return query, nil
 }
 
+func parseTagFilter(raw string, field string) ([]string, error) {
+	seen := map[string]bool{}
+	result := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		name := domain.NormalizeTagName(part)
+		if name == "" || seen[name] {
+			continue
+		}
+		if len([]rune(name)) > 48 {
+			return nil, domain.Invalid(field, field+" entries must be at most 48 characters")
+		}
+		seen[name] = true
+		result = append(result, name)
+	}
+	if len(result) > maxFilterTags {
+		return nil, domain.Invalid(field, field+" accepts at most 24 tags")
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func parseYearValue(raw string) (int, bool) {
+	year, err := strconv.Atoi(raw)
+	if err != nil || year < 1000 || year > 2100 {
+		return 0, false
+	}
+	return year, true
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func (q Query) includes(value domain.Artifact) bool {
 	if q.Status != "" {
 		return value.Status == q.Status
@@ -101,11 +191,24 @@ func (q Query) Describe() string {
 	if q.Keyword != "" {
 		parts = append(parts, "q="+q.Keyword)
 	}
-	if q.Tag != "" {
-		parts = append(parts, "tag="+q.Tag)
+	if len(q.Tags) > 0 {
+		separator := "+"
+		if q.TagMode == TagMatchAny {
+			separator = "|"
+		}
+		parts = append(parts, "tag="+strings.Join(q.Tags, separator))
+	}
+	if len(q.ExcludeTags) > 0 {
+		parts = append(parts, "exclude_tag="+strings.Join(q.ExcludeTags, "|"))
 	}
 	if q.Year > 0 {
 		parts = append(parts, fmt.Sprintf("year=%d", q.Year))
+	}
+	if q.YearFrom > 0 {
+		parts = append(parts, fmt.Sprintf("year_from=%d", q.YearFrom))
+	}
+	if q.YearTo > 0 {
+		parts = append(parts, fmt.Sprintf("year_to=%d", q.YearTo))
 	}
 	if q.Status != "" {
 		parts = append(parts, "status="+string(q.Status))
@@ -149,15 +252,45 @@ func filterArtifacts(values []domain.Artifact, query Query) []domain.Artifact {
 		if keyword != "" && !strings.Contains(metadata.SearchText(), keyword) {
 			continue
 		}
-		if query.Tag != "" && !domain.HasTag(value.Tags, query.Tag) {
+		if len(query.Tags) > 0 && !tagsMatch(value.Tags, query.Tags, query.TagMode) {
+			continue
+		}
+		if len(query.ExcludeTags) > 0 && hasAnyTag(value.Tags, query.ExcludeTags) {
 			continue
 		}
 		if query.Year > 0 && value.Year != query.Year {
 			continue
 		}
+		if query.YearFrom > 0 && value.Year < query.YearFrom {
+			continue
+		}
+		if query.YearTo > 0 && value.Year > query.YearTo {
+			continue
+		}
 		result = append(result, value)
 	}
 	return result
+}
+
+func tagsMatch(tags []domain.Tag, wanted []string, mode string) bool {
+	if mode == TagMatchAny {
+		return hasAnyTag(tags, wanted)
+	}
+	for _, name := range wanted {
+		if !domain.HasTag(tags, name) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasAnyTag(tags []domain.Tag, wanted []string) bool {
+	for _, name := range wanted {
+		if domain.HasTag(tags, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortArtifacts(values []domain.Artifact, order string) {

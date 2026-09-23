@@ -191,6 +191,13 @@ func checkSearchExport(ctx context.Context, h *harness) error {
 	if err != nil {
 		return err
 	}
+	third, err := h.createWithYear(ctx, "Mining town census", "Census tables for a mining town and its households", 1948, []string{"mining", "census"})
+	if err != nil {
+		return err
+	}
+	if _, err := h.create(ctx, "Orchard survey draft", "Draft survey notes for orchard plots and boundaries", []string{"orchard", "survey"}); err != nil {
+		return err
+	}
 	if _, err := h.submit(ctx, first.ID); err != nil {
 		return err
 	}
@@ -200,12 +207,137 @@ func checkSearchExport(ctx context.Context, h *harness) error {
 	if _, err := h.submit(ctx, second.ID); err != nil {
 		return err
 	}
+	if _, err := h.submit(ctx, third.ID); err != nil {
+		return err
+	}
+	if _, err := h.review(ctx, third.ID, "approve", "curator-lin", ""); err != nil {
+		return err
+	}
+
+	// Single tag filtering keeps working and produces a verifiable checksum.
 	collection, err := h.exportCollection(ctx, "tag=map")
 	if err != nil {
 		return err
 	}
 	if collection.Count != 1 || len(collection.Artifacts) != 1 || !catalog.VerifyCollectionChecksum(collection) {
 		return fmt.Errorf("unexpected collection export: %#v", collection)
+	}
+
+	// Combined tag, exclusion and year-range filters in the public view.
+	for _, step := range []struct {
+		query string
+		want  int
+	}{
+		{"tag=mining,map", 1},            // all tags required
+		{"tag=mining&tag=map", 1},        // repeated parameters combine like commas
+		{"tag=map,census&tag_mode=any", 2}, // any tag matches
+		{"tag=mining&exclude_tag=map", 1},
+		{"year_from=1940&year_to=1950", 1},
+		{"year=1932", 1},
+		{"tag=orchard", 0}, // drafts stay hidden in the public view
+		{"tag=harbor", 0},  // pending review stays hidden in the public view
+		{"view=working&tag=orchard", 1},
+		{"view=working&tag=harbor", 1},
+		{"view=working&tag=mining&tag_mode=any", 2},
+	} {
+		if err := h.expectExportCount(ctx, step.query, step.want); err != nil {
+			return err
+		}
+	}
+
+	// Empty results are explicit: count zero, an empty array and a valid checksum.
+	empty, err := h.exportCollection(ctx, "tag=mining,map,census")
+	if err != nil {
+		return err
+	}
+	if empty.Count != 0 || len(empty.Artifacts) != 0 || !catalog.VerifyCollectionChecksum(empty) {
+		return fmt.Errorf("unexpected empty collection export: %#v", empty)
+	}
+	if !strings.Contains(empty.Query, "tag=census+map+mining") {
+		return fmt.Errorf("empty export query description missing filters: %q", empty.Query)
+	}
+	body, err := h.getRaw(ctx, queryPath("/artifacts", "tag=mining,map,census"))
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(body, `"count":0`) || !strings.Contains(body, `"artifacts":[]`) {
+		return fmt.Errorf("empty list response is not explicit: %s", body)
+	}
+
+	// Invalid filter combinations are rejected on both list and export routes.
+	for _, bad := range []string{
+		"year=1932&year_from=1930",
+		"year=1932&year_to=1940",
+		"year_from=1950&year_to=1940",
+		"tag=mining&exclude_tag=mining",
+		"tag_mode=any",
+		"tag=mining&tag_mode=sideways",
+	} {
+		if err := h.expectInvalidQuery(ctx, queryPath("/artifacts", bad)); err != nil {
+			return err
+		}
+		if err := h.expectInvalidQuery(ctx, queryPath("/collections/export", bad)); err != nil {
+			return err
+		}
+	}
+
+	// List and export apply identical filters and describe them identically.
+	for _, query := range []string{
+		"tag=mining&tag_mode=any",
+		"tag=mining&exclude_tag=map&year_from=1900&year_to=1950",
+		"view=working&tag=harbor",
+	} {
+		if err := h.expectListExportConsistency(ctx, query); err != nil {
+			return err
+		}
+	}
+
+	// Every filter dimension shows up in the exported query description.
+	described, err := h.exportCollection(ctx, "tag=mining,map&tag_mode=any&exclude_tag=census&year_from=1900&year_to=1950")
+	if err != nil {
+		return err
+	}
+	for _, part := range []string{"tag=map|mining", "exclude_tag=census", "year_from=1900", "year_to=1950"} {
+		if !strings.Contains(described.Query, part) {
+			return fmt.Errorf("export query description %q missing %q", described.Query, part)
+		}
+	}
+	return nil
+}
+
+func (h *harness) expectExportCount(ctx context.Context, query string, want int) error {
+	collection, err := h.exportCollection(ctx, query)
+	if err != nil {
+		return err
+	}
+	if collection.Count != want || len(collection.Artifacts) != want {
+		return fmt.Errorf("export %q count = %d, want %d", query, collection.Count, want)
+	}
+	if !catalog.VerifyCollectionChecksum(collection) {
+		return fmt.Errorf("export %q checksum invalid", query)
+	}
+	return nil
+}
+
+func (h *harness) expectListExportConsistency(ctx context.Context, query string) error {
+	listed, err := h.listArtifacts(ctx, query)
+	if err != nil {
+		return err
+	}
+	exported, err := h.exportCollection(ctx, query)
+	if err != nil {
+		return err
+	}
+	if listed.Query != exported.Query {
+		return fmt.Errorf("query description mismatch for %q: list %q vs export %q", query, listed.Query, exported.Query)
+	}
+	if listed.Count != exported.Count || len(listed.Artifacts) != len(exported.Artifacts) {
+		return fmt.Errorf("count mismatch for %q: list %d vs export %d", query, listed.Count, exported.Count)
+	}
+	for index := range listed.Artifacts {
+		if listed.Artifacts[index].ID != exported.Artifacts[index].ID {
+			return fmt.Errorf("artifact mismatch for %q at %d: list %s vs export %s", query, index, listed.Artifacts[index].ID, exported.Artifacts[index].ID)
+		}
 	}
 	return nil
 }
@@ -252,11 +384,15 @@ func checkImportBatch(ctx context.Context, h *harness) error {
 }
 
 func (h *harness) create(ctx context.Context, title, summary string, tags []string) (domain.Artifact, error) {
+	return h.createWithYear(ctx, title, summary, 1932, tags)
+}
+
+func (h *harness) createWithYear(ctx context.Context, title, summary string, year int, tags []string) (domain.Artifact, error) {
 	input := domain.CreateArtifact{
 		Title:   title,
 		Summary: summary,
 		Source:  "Reading room transfer",
-		Year:    1932,
+		Year:    year,
 		Tags:    tags,
 	}
 	var artifact domain.Artifact
@@ -315,16 +451,68 @@ func (h *harness) exportArtifact(ctx context.Context, id string) (domain.Artifac
 	return artifact, nil
 }
 
-func (h *harness) exportCollection(ctx context.Context, query string) (catalog.Collection, error) {
-	path := "/collections/export?view=public"
-	if strings.TrimSpace(query) != "" {
-		path += "&" + strings.TrimSpace(query)
+type listResult struct {
+	Count     int               `json:"count"`
+	Query     string            `json:"query"`
+	Artifacts []domain.Artifact `json:"artifacts"`
+}
+
+func queryPath(base, query string) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return base + "?view=public"
 	}
+	if strings.Contains(query, "view=") {
+		return base + "?" + query
+	}
+	return base + "?view=public&" + query
+}
+
+func (h *harness) listArtifacts(ctx context.Context, query string) (listResult, error) {
+	var result listResult
+	if err := h.request(ctx, http.MethodGet, queryPath("/artifacts", query), nil, &result); err != nil {
+		return listResult{}, err
+	}
+	return result, nil
+}
+
+func (h *harness) exportCollection(ctx context.Context, query string) (catalog.Collection, error) {
 	var collection catalog.Collection
-	if err := h.request(ctx, http.MethodGet, path, nil, &collection); err != nil {
+	if err := h.request(ctx, http.MethodGet, queryPath("/collections/export", query), nil, &collection); err != nil {
 		return catalog.Collection{}, err
 	}
 	return collection, nil
+}
+
+func (h *harness) getRaw(ctx context.Context, path string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, h.base+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	response, err := h.client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if err != nil {
+		return "", fmt.Errorf("read GET %s: %w", path, err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("GET %s returned %d: %s", path, response.StatusCode, strings.TrimSpace(string(data)))
+	}
+	return string(data), nil
+}
+
+func (h *harness) expectInvalidQuery(ctx context.Context, path string) error {
+	err := h.request(ctx, http.MethodGet, path, nil, nil)
+	if err == nil {
+		return fmt.Errorf("GET %s unexpectedly succeeded", path)
+	}
+	if !strings.Contains(err.Error(), "returned 400") || !strings.Contains(err.Error(), "invalid_input") {
+		return fmt.Errorf("GET %s returned unexpected error: %w", path, err)
+	}
+	return nil
 }
 
 func (h *harness) importBatch(ctx context.Context, items []domain.CreateArtifact) (catalog.BatchResult, error) {

@@ -31,7 +31,7 @@ go run ./cmd/archiveweave --addr 127.0.0.1:8080 --data ./var/artifacts.json --au
 - `GET /catalog/summary`：档案总量、状态分布、年份范围和常用标签。
 - `POST /artifacts`：受理单条草稿档案。
 - `POST /artifacts/batch`：批量受理草稿档案。
-- `GET /artifacts`：检索档案，支持关键词、标签、年份、状态、视图、排序和分页。
+- `GET /artifacts`：检索档案，支持关键词、多标签组合、标签排除、年份范围、状态、视图、排序和分页。
 - `GET /artifacts/{id}`：读取单条档案。
 - `PUT /artifacts/{id}/metadata`：修订草稿元数据。
 - `POST /artifacts/{id}/submit`：提交审核。
@@ -41,6 +41,20 @@ go run ./cmd/archiveweave --addr 127.0.0.1:8080 --data ./var/artifacts.json --au
 - `GET /collections/export`：导出带校验和的公开集合。
 
 写接口可以读取 `X-Archive-Actor` 请求头记录操作者。档案创建、修订、提交、批准和退回都会生成不可覆盖的审计事件。
+
+## 筛选参数
+
+`GET /artifacts` 与 `GET /collections/export` 共享同一套筛选参数，列表命中的集合与导出的集合始终一致，规范化后的筛选描述会写入响应的 `query` 字段：
+
+- `q`：关键词，匹配标题、摘要、来源和标签。
+- `tag`：包含标签，支持逗号分隔（`tag=mining,map`）或重复参数（`tag=mining&tag=map`），最多 24 个。
+- `tag_mode`：多标签组合关系，`all`（默认，须全部命中）或 `any`（命中任一即可）。
+- `exclude_tag`：排除标签，格式同 `tag`，命中任一排除标签的档案被剔除。
+- `year`：精确年份；`year_from` / `year_to`：闭区间年份范围。`year` 不能与 `year_from`、`year_to` 同时使用。
+- `view`：`public`（默认，只含已批准档案）或 `working`（内部工作视图，含草稿与待审核）。
+- `status`、`sort`、`offset`、`limit`：状态过滤、排序与分页；公开视图只允许 `status=approved`。
+
+没有命中的请求返回 `200`，`count` 为 0 且 `artifacts` 为空数组，导出同样生成带有效校验和的空集合。非法组合（如 `year` 与年份范围混用、`year_from` 晚于 `year_to`、同一标签既包含又排除、`tag_mode` 缺少 `tag`）返回 `400` 与 `invalid_input` 错误，并指出冲突字段。
 
 ## 工作流检查
 
